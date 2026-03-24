@@ -9,4 +9,4 @@ cloudinary
 numpy
 psycopg2-binary
 python-multipart
-bcrypt 
+bcrypt==3.2.2
