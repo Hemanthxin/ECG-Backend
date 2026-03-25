@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import requests, os, math, json
 
+# --- Google Imports ---
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
 import cloudinary
 import cloudinary.uploader
 
@@ -105,6 +109,9 @@ class UserLogin(BaseModel):
     email:    str
     password: str
 
+class GoogleLoginRequest(BaseModel):
+    token: str
+
 class UserProfileUpdate(BaseModel):
     email:     str
     full_name: str
@@ -129,20 +136,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── HuggingFace Space URL ─────────────────────────────────────────────────────
-# HOW TO FIND YOUR CORRECT URL:
-#   1. Go to https://huggingface.co/spaces
-#   2. Find your Space → click it → click the "App" tab
-#   3. The browser URL will look like: https://bhemanth-ecg-digitizer.hf.space
-#   4. Set HF_SPACE_URL=https://bhemanth-<your-exact-space-name>.hf.space in your .env
-#
-# Common mistake: Space name in URL uses hyphens not underscores, e.g.
-#   Space named "ecg hf space" → URL is "bhemanth-ecg-hf-space.hf.space"
-#   Space named "ECG_Digitizer" → URL is "bhemanth-ecg-digitizer.hf.space"
-#
 HF_SPACE_URL      = os.getenv("HF_SPACE_URL", "https://bhemanth-ecg-hf-space.hf.space")
 HF_API_ENDPOINT   = f"{HF_SPACE_URL.rstrip('/')}/analyze-ecg"
-HF_TOKEN          = os.getenv("HF_TOKEN", None)   # only needed for private Spaces
+HF_TOKEN          = os.getenv("HF_TOKEN", None)
+GOOGLE_CLIENT_ID  = os.getenv("GOOGLE_CLIENT_ID", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH ENDPOINTS
@@ -183,6 +180,53 @@ def login(body: UserLogin, db: Session = Depends(get_db)):
             "is_profile_complete": is_profile_complete,
         }
     }
+
+@app.post("/api/google-login")
+def google_login(body: GoogleLoginRequest, db: Session = Depends(get_db)):
+    try:
+        # Verify the token via Google's library
+        idinfo = id_token.verify_oauth2_token(
+            body.token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        email = idinfo['email']
+        name = idinfo.get('name', '')
+        
+        # Check if user already exists
+        user = db.query(UserDB).filter(UserDB.email == email).first()
+        
+        if not user:
+            # Create a new user account if they don't exist
+            # Generating a random/dummy hash since they will auth via Google
+            dummy_password = f"google_sso_{datetime.utcnow().timestamp()}"
+            user = UserDB(
+                full_name       = name,
+                email           = email,
+                hashed_password = get_password_hash(dummy_password),
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        is_profile_complete = bool(user.age and user.gender and user.phone)
+
+        return {
+            "token": f"fake-jwt-{user.id}",
+            "user": {
+                "id":                  user.id,
+                "name":                user.full_name or "",
+                "email":               user.email,
+                "age":                 user.age,
+                "gender":              user.gender,
+                "phone":               user.phone,
+                "is_profile_complete": is_profile_complete,
+            }
+        }
+    except ValueError:
+        # Invalid token
+        raise HTTPException(status_code=401, detail="Invalid Google authentication token")
 
 
 @app.post("/api/update-profile")
@@ -257,7 +301,7 @@ async def upload_ecg(
             files   = {"file": (file.filename, content, file.content_type or "image/png")},
             headers = headers,
             verify  = False,
-            timeout = 180,      # HF Spaces need extra time on cold start
+            timeout = 180,
         )
 
         print("HF STATUS:", hf_response.status_code)
@@ -359,17 +403,15 @@ async def upload_ecg(
         raise HTTPException(status_code=500, detail=f"Error saving scan result: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCAN HISTORY  ← THIS WAS THE MISSING ENDPOINT CAUSING 404
+# SCAN HISTORY 
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scan-history")
 def scan_history(email: str, db: Session = Depends(get_db)):
-    # Find user
     user = db.query(UserDB).filter(UserDB.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Get all scans for this user, newest first
     scans = (
         db.query(ScanDB)
         .filter(ScanDB.user_id == user.id)
@@ -377,7 +419,6 @@ def scan_history(email: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    # Build scan list
     scan_list = []
     for s in scans:
         scan_list.append({
@@ -392,7 +433,6 @@ def scan_history(email: str, db: Session = Depends(get_db)):
             "created_at":  s.created_at.strftime("%d %b %Y, %I:%M %p") if s.created_at else "—",
         })
 
-    # Aggregate stats
     total_scans  = len(scans)
     dur_values   = [s.duration for s in scans if s.duration is not None]
     lead_values  = [s.leads_count for s in scans if s.leads_count is not None]
@@ -408,7 +448,7 @@ def scan_history(email: str, db: Session = Depends(get_db)):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INDIVIDUAL SCAN DETAIL (bonus — used by UploadECG history if needed)
+# INDIVIDUAL SCAN DETAIL 
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scan/{scan_id}")
