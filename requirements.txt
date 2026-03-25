@@ -9,5 +9,9 @@ cloudinary
 numpy
 psycopg2-binary
 python-multipart
+<<<<<<< HEAD
 bcrypt 
 google-auth
+=======
+bcrypt==3.2.2
+>>>>>>> 5db9081d0db2ae74ebce84de37bd5281b660bc05
