@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Text
@@ -126,7 +126,7 @@ class ChangePasswordRequest(BaseModel):
 class DeleteAccountRequest(BaseModel):
     email: str
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App & Config ──────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -136,10 +136,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HF_SPACE_URL      = os.getenv("HF_SPACE_URL", "https://bhemanth-ecg-hf-space.hf.space")
-HF_API_ENDPOINT   = f"{HF_SPACE_URL.rstrip('/')}/analyze-ecg"
-HF_TOKEN          = os.getenv("HF_TOKEN", None)
-GOOGLE_CLIENT_ID  = os.getenv("GOOGLE_CLIENT_ID", "")
+HF_SPACE_URL        = os.getenv("HF_SPACE_URL", "https://bhemanth-ecg-hf-space.hf.space")
+HF_API_ENDPOINT     = f"{HF_SPACE_URL.rstrip('/')}/analyze-ecg"
+HF_TOKEN            = os.getenv("HF_TOKEN", None)
+GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
+
+# ── WHATSAPP WEBHOOK CONFIG ──
+WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "my_super_secret_ecg_token_123")
+META_API_TOKEN       = os.getenv("META_API_TOKEN", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH ENDPOINTS
@@ -329,7 +333,7 @@ async def upload_ecg(
 
         if hf_response.status_code != 200:
             raise HTTPException(
-                status_code=500,
+                status_code=hf_response.status_code,
                 detail=(
                     f"HF Space returned HTTP {hf_response.status_code}. "
                     f"Response: {hf_response.text[:400]}"
@@ -401,6 +405,140 @@ async def upload_ecg(
     except Exception as e:
         print("DB/PARSE ERROR:", e)
         raise HTTPException(status_code=500, detail=f"Error saving scan result: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WHATSAPP META WEBHOOK (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_whatsapp_text(phone_number_id: str, to_number: str, text: str):
+    """Helper function to send a standard text reply via Meta API"""
+    url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_API_TOKEN}", 
+        "Content-Type": "application/json"
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": text}
+    }
+    requests.post(url, headers=headers, json=data)
+
+def process_meta_image_bg(image_id: str, sender_phone: str, phone_number_id: str):
+    """Background task to download the image from Meta, run AI, and reply."""
+    try:
+        # 1. Ask Meta for the Image Download URL
+        url_req = requests.get(
+            f"https://graph.facebook.com/v18.0/{image_id}", 
+            headers={"Authorization": f"Bearer {META_API_TOKEN}"}
+        )
+        image_url = url_req.json().get('url')
+        
+        if not image_url:
+            send_whatsapp_text(phone_number_id, sender_phone, "⚠️ Could not download image from WhatsApp servers.")
+            return
+
+        # 2. Download the image bytes securely from Meta
+        img_response = requests.get(
+            image_url, 
+            headers={"Authorization": f"Bearer {META_API_TOKEN}"}
+        )
+        content = img_response.content
+
+        # 3. Forward the image to your existing Hugging Face Space ML logic
+        headers = {}
+        if HF_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+        hf_response = requests.post(
+            HF_API_ENDPOINT,
+            files={"file": (f"wa_image_{image_id}.jpg", content, "image/jpeg")},
+            headers=headers,
+            verify=False,
+            timeout=180,
+        )
+
+        # 4. Handle Hugging Face custom rejections / errors
+        if hf_response.status_code != 200:
+            try:
+                error_detail = hf_response.json().get("detail", "Error connecting to AI.")
+            except:
+                error_detail = "Failed to process image."
+            
+            # Send the exact rejection text back via WhatsApp
+            send_whatsapp_text(phone_number_id, sender_phone, f"⚠️ {str(error_detail).capitalize()}")
+            return
+
+        # 5. Successfully Processed! Format and send the response
+        data = hf_response.json()
+        ecg_data = data.get("data", data)
+        lead_list = ecg_data.get("lead_list", [])
+        duration = compute_duration(ecg_data.get("signals", {}))
+
+        reply = (
+            f"✅ *Analysis Complete!*\n"
+            f"Extracted {len(lead_list)}/13 leads.\n"
+            f"Duration: {duration}s\n\n"
+            f"Log in to the web dashboard to view the full graphical report and download the PDF."
+        )
+        send_whatsapp_text(phone_number_id, sender_phone, reply)
+
+    except Exception as e:
+        print(f"Meta Background Task Error: {e}")
+        send_whatsapp_text(phone_number_id, sender_phone, "⚠️ An error occurred while processing your ECG.")
+
+@app.get("/whatsapp-webhook")
+async def verify_webhook(request: Request):
+    """Meta will send a GET request here once to verify your server endpoint."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == WEBHOOK_VERIFY_TOKEN:
+        # Meta requires you to return the raw challenge integer
+        return Response(content=challenge, media_type="text/plain")
+    return Response(content="Forbidden", status_code=403)
+
+@app.post("/whatsapp-webhook")
+async def receive_whatsapp_message(request: Request, background_tasks: BackgroundTasks):
+    """Meta will POST JSON data here every time someone sends your bot a message."""
+    body = await request.json()
+    try:
+        if 'entry' in body and body['entry']:
+            entry = body['entry'][0]['changes'][0]['value']
+            
+            if 'messages' in entry:
+                message = entry['messages'][0]
+                sender_phone = message['from']
+                phone_number_id = entry['metadata']['phone_number_id']
+
+                # Check if they sent an image
+                if message['type'] == 'image':
+                    image_id = message['image']['id']
+                    
+                    # Send an immediate text back acknowledging receipt
+                    send_whatsapp_text(
+                        phone_number_id, 
+                        sender_phone, 
+                        "🫀 Image received! Digitizing the 12-lead ECG. Please wait ~30 seconds..."
+                    )
+                    
+                    # Run the heavy AI in the background so we return HTTP 200 immediately
+                    background_tasks.add_task(process_meta_image_bg, image_id, sender_phone, phone_number_id)
+                else:
+                    # They sent a regular text or file type we don't support
+                    send_whatsapp_text(
+                        phone_number_id, 
+                        sender_phone, 
+                        "Hello! Please send a clear image of a 12-Lead ECG for me to analyze."
+                    )
+                    
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        return {"status": "error"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCAN HISTORY 
