@@ -188,22 +188,16 @@ def login(body: UserLogin, db: Session = Depends(get_db)):
 @app.post("/api/google-login")
 def google_login(body: GoogleLoginRequest, db: Session = Depends(get_db)):
     try:
-        # Verify the token via Google's library
         idinfo = id_token.verify_oauth2_token(
-            body.token, 
-            google_requests.Request(), 
+            body.token,
+            google_requests.Request(),
             GOOGLE_CLIENT_ID
         )
-
         email = idinfo['email']
-        name = idinfo.get('name', '')
-        
-        # Check if user already exists
+        name  = idinfo.get('name', '')
+
         user = db.query(UserDB).filter(UserDB.email == email).first()
-        
         if not user:
-            # Create a new user account if they don't exist
-            # Generating a random/dummy hash since they will auth via Google
             dummy_password = f"google_sso_{datetime.utcnow().timestamp()}"
             user = UserDB(
                 full_name       = name,
@@ -215,7 +209,6 @@ def google_login(body: GoogleLoginRequest, db: Session = Depends(get_db)):
             db.refresh(user)
 
         is_profile_complete = bool(user.age and user.gender and user.phone)
-
         return {
             "token": f"fake-jwt-{user.id}",
             "user": {
@@ -229,7 +222,6 @@ def google_login(body: GoogleLoginRequest, db: Session = Depends(get_db)):
             }
         }
     except ValueError:
-        # Invalid token
         raise HTTPException(status_code=401, detail="Invalid Google authentication token")
 
 
@@ -266,7 +258,7 @@ def delete_account(body: DeleteAccountRequest, db: Session = Depends(get_db)):
     return {"message": "Account deleted"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ECG UPLOAD
+# ECG UPLOAD  ← main change: pass through all new pipeline fields
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/upload-ecg")
@@ -279,7 +271,7 @@ async def upload_ecg(
 
     content = await file.read()
 
-    # ── Step 2: Upload to Cloudinary ─────────────────────────────────────────
+    # ── Step 2: Upload original to Cloudinary ────────────────────────────────
     try:
         upload_result = cloudinary.uploader.upload(
             content,
@@ -305,7 +297,7 @@ async def upload_ecg(
             files   = {"file": (file.filename, content, file.content_type or "image/png")},
             headers = headers,
             verify  = False,
-            timeout = 180,
+            timeout = 240,          # slightly longer for grid-first pipeline
         )
 
         print("HF STATUS:", hf_response.status_code)
@@ -325,11 +317,20 @@ async def upload_ecg(
                 detail=(
                     f"HF Space endpoint not found (404). "
                     f"URL tried: {HF_API_ENDPOINT}. "
-                    f"Fix: Go to https://huggingface.co/spaces, open your Space, "
-                    f"click the App tab, copy the exact URL, and set "
-                    f"HF_SPACE_URL=<that_url> in your .env file."
+                    f"Fix: set HF_SPACE_URL=<correct_url> in your .env file."
                 )
             )
+
+        # ── Forward HF-level 400 errors (invalid image, blur, not ECG) ──────
+        # The HF Space returns {"status":"error","detail":"..."} with HTTP 400
+        # for validation failures. We pass those straight through to the
+        # frontend so it can display the exact message.
+        if hf_response.status_code == 400:
+            try:
+                err_body = hf_response.json()
+            except Exception:
+                err_body = {"status": "error", "detail": hf_response.text[:300]}
+            return err_body   # already {"status":"error","detail":"..."}
 
         if hf_response.status_code != 200:
             raise HTTPException(
@@ -341,7 +342,10 @@ async def upload_ecg(
             )
 
         data = hf_response.json()
-        print("STEP 4: HF RESPONSE PARSED OK — leads:", len(data.get("data", data).get("lead_list", [])))
+        print(
+            "STEP 4: HF RESPONSE PARSED OK — leads:",
+            len(data.get("data", data).get("lead_list", []))
+        )
 
     except HTTPException:
         raise
@@ -349,7 +353,7 @@ async def upload_ecg(
         raise HTTPException(
             status_code=504,
             detail=(
-                "HuggingFace Space request timed out after 180s. "
+                "HuggingFace Space request timed out after 240s. "
                 "The Space may be in cold start mode — wait 30 seconds and retry."
             )
         )
@@ -368,8 +372,8 @@ async def upload_ecg(
         signals   = ecg_data.get("signals",   {})
         lead_list = ecg_data.get("lead_list", [])
 
-        snr       = compute_snr(signals)
-        duration  = compute_duration(signals)
+        snr      = compute_snr(signals)
+        duration = compute_duration(signals)
         record_id = file.filename.replace(".", "_").replace(" ", "_")
 
         if email:
@@ -390,10 +394,18 @@ async def upload_ecg(
                 db.commit()
                 print("STEP 5: SCAN SAVED TO DB — id:", scan.id)
 
+        # ── Build final response, passing ALL new pipeline fields through ─────
+        # The HF Space now returns these extra keys in ecg_data:
+        #   grid_crop_b64       — cropped grid region image (base64 PNG)
+        #   yolo_detections_b64 — YOLO-annotated grid image (base64 PNG)
+        #   grid_detect_b64     — original image with grid bbox drawn (base64 PNG)
+        #   grid_bbox           — [x1, y1, x2, y2] of detected grid
+        #   valid_leads         — count of non-flat leads extracted
+        # We spread ecg_data so ALL fields are forwarded transparently.
         return {
             "status": "success",
             "data": {
-                **ecg_data,
+                **ecg_data,                        # includes all new pipeline fields
                 "image_url":         image_url,
                 "computed_snr":      snr,
                 "computed_duration": duration,
@@ -408,78 +420,78 @@ async def upload_ecg(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WHATSAPP META WEBHOOK (NEW)
+# WHATSAPP META WEBHOOK
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_whatsapp_text(phone_number_id: str, to_number: str, text: str):
-    """Helper function to send a standard text reply via Meta API"""
     url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
     headers = {
-        "Authorization": f"Bearer {META_API_TOKEN}", 
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {META_API_TOKEN}",
+        "Content-Type":  "application/json"
     }
     data = {
         "messaging_product": "whatsapp",
-        "to": to_number,
+        "to":   to_number,
         "type": "text",
         "text": {"body": text}
     }
     requests.post(url, headers=headers, json=data)
 
 def process_meta_image_bg(image_id: str, sender_phone: str, phone_number_id: str):
-    """Background task to download the image from Meta, run AI, and reply."""
+    """Background task: download from Meta, run AI pipeline, reply with summary."""
     try:
-        # 1. Ask Meta for the Image Download URL
-        url_req = requests.get(
-            f"https://graph.facebook.com/v18.0/{image_id}", 
+        # 1. Get image download URL from Meta
+        url_req   = requests.get(
+            f"https://graph.facebook.com/v18.0/{image_id}",
             headers={"Authorization": f"Bearer {META_API_TOKEN}"}
         )
-        image_url = url_req.json().get('url')
-        
+        image_url = url_req.json().get("url")
+
         if not image_url:
-            send_whatsapp_text(phone_number_id, sender_phone, "⚠️ Could not download image from WhatsApp servers.")
+            send_whatsapp_text(phone_number_id, sender_phone,
+                               "⚠️ Could not download image from WhatsApp servers.")
             return
 
-        # 2. Download the image bytes securely from Meta
+        # 2. Download image bytes
         img_response = requests.get(
-            image_url, 
+            image_url,
             headers={"Authorization": f"Bearer {META_API_TOKEN}"}
         )
         content = img_response.content
 
-        # 3. Forward the image to your existing Hugging Face Space ML logic
-        headers = {}
+        # 3. Forward to HF Space
+        hf_headers = {}
         if HF_TOKEN:
-            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+            hf_headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
         hf_response = requests.post(
             HF_API_ENDPOINT,
-            files={"file": (f"wa_image_{image_id}.jpg", content, "image/jpeg")},
-            headers=headers,
-            verify=False,
-            timeout=180,
+            files   = {"file": (f"wa_image_{image_id}.jpg", content, "image/jpeg")},
+            headers = hf_headers,
+            verify  = False,
+            timeout = 240,
         )
 
-        # 4. Handle Hugging Face custom rejections / errors
+        # 4. Handle errors
         if hf_response.status_code != 200:
             try:
                 error_detail = hf_response.json().get("detail", "Error connecting to AI.")
-            except:
+            except Exception:
                 error_detail = "Failed to process image."
-            
-            # Send the exact rejection text back via WhatsApp
-            send_whatsapp_text(phone_number_id, sender_phone, f"⚠️ {str(error_detail).capitalize()}")
+            send_whatsapp_text(phone_number_id, sender_phone,
+                               f"⚠️ {str(error_detail).capitalize()}")
             return
 
-        # 5. Successfully Processed! Format and send the response
-        data = hf_response.json()
-        ecg_data = data.get("data", data)
+        # 5. Parse and reply
+        data      = hf_response.json()
+        ecg_data  = data.get("data", data)
         lead_list = ecg_data.get("lead_list", [])
-        duration = compute_duration(ecg_data.get("signals", {}))
+        valid     = ecg_data.get("valid_leads", len(lead_list))
+        duration  = compute_duration(ecg_data.get("signals", {}))
 
         reply = (
             f"✅ *Analysis Complete!*\n"
-            f"Extracted {len(lead_list)}/13 leads.\n"
+            f"Extracted {valid}/13 leads.\n"
             f"Duration: {duration}s\n\n"
             f"Log in to the web dashboard to view the full graphical report and download the PDF."
         )
@@ -487,61 +499,50 @@ def process_meta_image_bg(image_id: str, sender_phone: str, phone_number_id: str
 
     except Exception as e:
         print(f"Meta Background Task Error: {e}")
-        send_whatsapp_text(phone_number_id, sender_phone, "⚠️ An error occurred while processing your ECG.")
+        send_whatsapp_text(phone_number_id, sender_phone,
+                           "⚠️ An error occurred while processing your ECG.")
 
 @app.get("/whatsapp-webhook")
 async def verify_webhook(request: Request):
-    """Meta will send a GET request here once to verify your server endpoint."""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
+    mode      = request.query_params.get("hub.mode")
+    token     = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
-
     if mode == "subscribe" and token == WEBHOOK_VERIFY_TOKEN:
-        # Meta requires you to return the raw challenge integer
         return Response(content=challenge, media_type="text/plain")
     return Response(content="Forbidden", status_code=403)
 
 @app.post("/whatsapp-webhook")
 async def receive_whatsapp_message(request: Request, background_tasks: BackgroundTasks):
-    """Meta will POST JSON data here every time someone sends your bot a message."""
     body = await request.json()
     try:
-        if 'entry' in body and body['entry']:
-            entry = body['entry'][0]['changes'][0]['value']
-            
-            if 'messages' in entry:
-                message = entry['messages'][0]
-                sender_phone = message['from']
-                phone_number_id = entry['metadata']['phone_number_id']
+        if "entry" in body and body["entry"]:
+            entry   = body["entry"][0]["changes"][0]["value"]
+            if "messages" in entry:
+                message         = entry["messages"][0]
+                sender_phone    = message["from"]
+                phone_number_id = entry["metadata"]["phone_number_id"]
 
-                # Check if they sent an image
-                if message['type'] == 'image':
-                    image_id = message['image']['id']
-                    
-                    # Send an immediate text back acknowledging receipt
+                if message["type"] == "image":
+                    image_id = message["image"]["id"]
                     send_whatsapp_text(
-                        phone_number_id, 
-                        sender_phone, 
+                        phone_number_id, sender_phone,
                         "🫀 Image received! Digitizing the 12-lead ECG. Please wait ~30 seconds..."
                     )
-                    
-                    # Run the heavy AI in the background so we return HTTP 200 immediately
-                    background_tasks.add_task(process_meta_image_bg, image_id, sender_phone, phone_number_id)
+                    background_tasks.add_task(
+                        process_meta_image_bg, image_id, sender_phone, phone_number_id
+                    )
                 else:
-                    # They sent a regular text or file type we don't support
                     send_whatsapp_text(
-                        phone_number_id, 
-                        sender_phone, 
+                        phone_number_id, sender_phone,
                         "Hello! Please send a clear image of a 12-Lead ECG for me to analyze."
                     )
-                    
         return {"status": "success"}
     except Exception as e:
         print(f"Webhook Error: {e}")
         return {"status": "error"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCAN HISTORY 
+# SCAN HISTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scan-history")
@@ -571,12 +572,12 @@ def scan_history(email: str, db: Session = Depends(get_db)):
             "created_at":  s.created_at.strftime("%d %b %Y, %I:%M %p") if s.created_at else "—",
         })
 
-    total_scans  = len(scans)
-    dur_values   = [s.duration for s in scans if s.duration is not None]
-    lead_values  = [s.leads_count for s in scans if s.leads_count is not None]
+    total_scans = len(scans)
+    dur_values  = [s.duration   for s in scans if s.duration   is not None]
+    lead_values = [s.leads_count for s in scans if s.leads_count is not None]
 
     avg_duration = f"{sum(dur_values) / len(dur_values):.1f}s" if dur_values else "—"
-    avg_leads    = round(sum(lead_values) / len(lead_values)) if lead_values else "—"
+    avg_leads    = round(sum(lead_values) / len(lead_values))   if lead_values else "—"
 
     return {
         "total_scans":  total_scans,
@@ -586,7 +587,7 @@ def scan_history(email: str, db: Session = Depends(get_db)):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INDIVIDUAL SCAN DETAIL 
+# INDIVIDUAL SCAN DETAIL
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scan/{scan_id}")
@@ -612,7 +613,7 @@ def get_scan(scan_id: int, db: Session = Depends(get_db)):
 
 @app.get("/")
 def root():
-    return {"status": "ECG Digitizer API running"}
+    return {"status": "ECG Digitizer API running — grid-first pipeline"}
 
 @app.get("/health")
 def health():
