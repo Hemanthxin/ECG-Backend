@@ -86,7 +86,7 @@ GOOGLE_CLIENT_ID         = os.getenv("GOOGLE_CLIENT_ID", "")
 WEBHOOK_VERIFY_TOKEN     = os.getenv("WEBHOOK_VERIFY_TOKEN", "ecg_digitizer_webhook_2024")
 META_API_TOKEN           = os.getenv("META_API_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-META_API_VERSION         = "v20.0"
+META_API_VERSION         = "v25.0"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def compute_snr(signals: dict) -> float:
