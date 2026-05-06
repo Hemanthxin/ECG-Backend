@@ -87,6 +87,7 @@ WEBHOOK_VERIFY_TOKEN     = os.getenv("WEBHOOK_VERIFY_TOKEN", "ecg_digitizer_webh
 META_API_TOKEN           = os.getenv("META_API_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 META_API_VERSION         = "v25.0"
+GROQ_API_KEY             = os.getenv("GROQ_API_KEY", "")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def compute_snr(signals: dict) -> float:
@@ -520,6 +521,74 @@ def _call_hf_space(image_bytes: bytes, filename: str) -> dict | None:
 
 
 # =============================================================================
+# GROQ AI — ECG / CARDIOLOGY Q&A
+# =============================================================================
+
+# Per-user conversation state:  phone -> list of {role, content} dicts
+# Stored in memory; resets on server restart (acceptable for WhatsApp bots)
+_user_sessions: dict[str, dict] = {}
+# Possible states: "menu" | "ecg_mode" | "qa_mode"
+
+_QA_SYSTEM = """You are a highly knowledgeable cardiologist assistant specialised in:
+- 12-lead ECG interpretation (rhythm, intervals, axis, morphology, ischaemia, arrhythmias)
+- Heart disease diagnosis, pathophysiology, and differential diagnosis
+- Treatment options, medications, interventional procedures, and lifestyle modifications
+- Preventive cardiology and cardiac risk factors
+
+Rules:
+1. Answer ONLY questions related to ECGs, cardiology, and heart disease.
+2. For unrelated questions, politely redirect: "I can only answer ECG and heart-disease questions. Please ask me something related to cardiology."
+3. Be concise but thorough — use plain language; avoid unnecessary jargon.
+4. Always add a disclaimer when giving clinical advice: "⚠️ This is for educational purposes only. Consult a licensed physician for personal medical decisions."
+5. Format responses clearly with bullet points or numbered lists where appropriate."""
+
+
+def _groq_call(question: str, history: list[dict]) -> str:
+    """
+    Call Groq Cloud with fallback across multiple Llama/Mixtral models.
+    history: list of {"role": "user"|"assistant", "content": str}
+    """
+    if not GROQ_API_KEY:
+        return "⚠️ GROQ_API_KEY is not configured on the server. Please contact the admin."
+
+    models = [
+        "llama-3.1-8b-instant",
+        "llama-3.1-70b-versatile",
+        "mixtral-8x7b-32768",
+    ]
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    messages = [{"role": "system", "content": _QA_SYSTEM}] + history + \
+               [{"role": "user", "content": question}]
+
+    for model in models:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json={"model": model, "messages": messages, "temperature": 0.3},
+                timeout=30,
+            )
+            data = r.json()
+            if "choices" in data and data["choices"]:
+                return data["choices"][0]["message"]["content"]
+            logger.warning("[GROQ] %s — %s", model, data.get("error", "unknown error"))
+        except Exception as e:
+            logger.error("[GROQ] %s failed: %s", model, e)
+
+    return "⚠️ AI service is temporarily unavailable. Please try again in a moment."
+
+
+def _get_session(phone: str) -> dict:
+    """Return or initialise session for a phone number."""
+    if phone not in _user_sessions:
+        _user_sessions[phone] = {"state": "menu", "qa_history": []}
+    return _user_sessions[phone]
+
+
+# =============================================================================
 # WHATSAPP BACKGROUND TASK
 # =============================================================================
 
@@ -579,7 +648,6 @@ def process_whatsapp_image(image_id: str, sender_phone: str, phone_number_id: st
         logger.info("[WA] PDF: %d bytes", len(pdf_bytes))
     except Exception as e:
         logger.error("[WA] PDF generation failed: %s", e)
-        # Fall back to text-only reply
         send_whatsapp_text(sender_phone,
             f"✅ ECG analysed: {n_valid}/12 leads, {duration}s — PDF generation failed, "
             f"view full report on the dashboard.", pid)
@@ -590,7 +658,6 @@ def process_whatsapp_image(image_id: str, sender_phone: str, phone_number_id: st
     pdf_url = upload_pdf_to_cloudinary(pdf_bytes, record_id)
 
     if not pdf_url:
-        # Cloudinary upload failed — send text summary instead
         logger.warning("[WA] Falling back to text-only reply")
         summary = (
             f"✅ *ECG Analysis Complete!*\n\n"
@@ -621,7 +688,6 @@ def process_whatsapp_image(image_id: str, sender_phone: str, phone_number_id: st
     ok = send_whatsapp_document(sender_phone, pdf_url, pdf_filename, caption, pid)
 
     if not ok:
-        # Document send failed (e.g. URL not yet public) — send link as text
         send_whatsapp_text(sender_phone,
             f"✅ ECG Report ready!\n📊 {n_valid}/12 leads  ·  ⏱ {duration}s\n\n"
             f"📄 Download PDF: {pdf_url}", pid)
@@ -651,6 +717,40 @@ async def verify_webhook(request: Request):
     return Response(content="Forbidden", status_code=403)
 
 
+# ── Welcome message ────────────────────────────────────────────────────────────
+_WELCOME_MSG = (
+    "👋 Welcome to *ECG Digitizer Bot*! 🫀\n\n"
+    "I can help you with:\n\n"
+    "1️⃣  *Digitize ECG* — Send a photo of your 12-lead ECG printout and I'll extract all leads, "
+    "measure signal amplitudes, and send you back a medical-grade PDF report 📄\n\n"
+    "2️⃣  *Ask a Question* — Ask me anything about ECGs, heart disease, arrhythmias, treatments, "
+    "and more — powered by AI 🤖\n\n"
+    "👉 Reply *1* to digitize an ECG\n"
+    "👉 Reply *2* to ask a cardiology question\n\n"
+    "You can type *menu* at any time to return here."
+)
+
+_MENU_PROMPT = (
+    "📋 *Main Menu*\n\n"
+    "👉 Reply *1* to digitize an ECG image\n"
+    "👉 Reply *2* to ask a cardiology / ECG question"
+)
+
+_ECG_PROMPT = (
+    "📸 *ECG Digitizer Mode*\n\n"
+    "Please send a clear photo of your 12-lead ECG printout.\n"
+    "I'll analyse it and send you a detailed PDF report in ~30 seconds.\n\n"
+    "_(Type *menu* to go back)_"
+)
+
+_QA_PROMPT = (
+    "🤖 *Cardiology Q&A Mode*\n\n"
+    "Ask me anything about ECGs, arrhythmias, heart disease, symptoms, "
+    "treatments, medications, or prevention.\n\n"
+    "_(Type *menu* to return to the main menu)_"
+)
+
+
 @app.post("/whatsapp-webhook")
 async def receive_whatsapp_message(request: Request, background_tasks: BackgroundTasks):
     """Receive all incoming WhatsApp events. Must return 200 immediately."""
@@ -678,41 +778,99 @@ async def receive_whatsapp_message(request: Request, background_tasks: Backgroun
 
         logger.info("[WA] %s from %s", msg_type, sender_phone)
 
-        if msg_type == "image":
-            image_id = message["image"]["id"]
-            # Immediate acknowledgement
-            send_whatsapp_text(
-                sender_phone,
-                "🫀 ECG image received!\n\nAnalysing your 12-lead ECG — you'll receive the PDF report in about 30 seconds...",
-                phone_number_id,
-            )
-            # Heavy work in background
-            background_tasks.add_task(
-                process_whatsapp_image, image_id, sender_phone, phone_number_id
-            )
+        session = _get_session(sender_phone)
+        state   = session["state"]
 
-        elif msg_type == "text":
-            txt = message.get("text", {}).get("body", "").strip().lower()
-            if any(k in txt for k in ["hi","hello","start","help","ecg"]):
+        # ── IMAGE received ────────────────────────────────────────────────────
+        if msg_type == "image":
+            if state == "qa_mode":
+                # User is in Q&A mode — remind them to switch
                 send_whatsapp_text(sender_phone,
-                    "👋 Hello! I'm the *ECG Digitizer Bot*.\n\n"
-                    "📸 Send me a clear photo of a *12-lead ECG printout* and I'll:\n"
-                    "   • Extract all 12 leads automatically\n"
-                    "   • Measure every signal in mV\n"
-                    "   • Send you back a *medical-grade PDF report* 📄\n\n"
-                    "Just send the image to get started! 🫀",
-                    phone_number_id,
-                )
+                    "📸 Image received, but you're in *Q&A mode*.\n\n"
+                    "To digitize an ECG, type *1* or *menu* first to switch modes.",
+                    phone_number_id)
             else:
+                # Default: process ECG image (works from menu or ecg_mode)
+                session["state"] = "ecg_mode"
                 send_whatsapp_text(sender_phone,
-                    "📸 Please send a clear photo of your 12-lead ECG to get started.",
-                    phone_number_id,
+                    "🫀 ECG image received!\n\n"
+                    "Analysing your 12-lead ECG — you'll receive the PDF report in about 30 seconds...",
+                    phone_number_id)
+                background_tasks.add_task(
+                    process_whatsapp_image, message["image"]["id"], sender_phone, phone_number_id
                 )
-        else:
+            return {"status": "ok"}
+
+        # ── TEXT received ─────────────────────────────────────────────────────
+        if msg_type != "text":
             send_whatsapp_text(sender_phone,
-                "📸 I only process ECG images. Please send a photo of your 12-lead ECG printout.",
-                phone_number_id,
-            )
+                "📸 I can process ECG images and text messages.\n"
+                "Type *menu* to see your options.",
+                phone_number_id)
+            return {"status": "ok"}
+
+        txt = message.get("text", {}).get("body", "").strip()
+        txt_lower = txt.lower()
+
+        # ── Global commands (work from any state) ─────────────────────────────
+        if txt_lower in ("menu", "back", "main menu", "0"):
+            session["state"]      = "menu"
+            session["qa_history"] = []
+            send_whatsapp_text(sender_phone, _MENU_PROMPT, phone_number_id)
+            return {"status": "ok"}
+
+        if txt_lower in ("hi", "hello", "start", "hey", "/start"):
+            session["state"]      = "menu"
+            session["qa_history"] = []
+            send_whatsapp_text(sender_phone, _WELCOME_MSG, phone_number_id)
+            return {"status": "ok"}
+
+        # ── Option selection from menu ────────────────────────────────────────
+        if state == "menu" or txt_lower in ("1", "2"):
+            if txt_lower == "1" or (state == "menu" and "1" in txt_lower and "ecg" in txt_lower):
+                session["state"] = "ecg_mode"
+                send_whatsapp_text(sender_phone, _ECG_PROMPT, phone_number_id)
+                return {"status": "ok"}
+
+            if txt_lower == "2" or (state == "menu" and "2" in txt_lower and "question" in txt_lower):
+                session["state"]      = "qa_mode"
+                session["qa_history"] = []
+                send_whatsapp_text(sender_phone, _QA_PROMPT, phone_number_id)
+                return {"status": "ok"}
+
+            if state == "menu":
+                # Unrecognised input while in menu — show menu again
+                send_whatsapp_text(sender_phone,
+                    f"Sorry, I didn't understand that.\n\n{_MENU_PROMPT}",
+                    phone_number_id)
+                return {"status": "ok"}
+
+        # ── ECG mode — text input ─────────────────────────────────────────────
+        if state == "ecg_mode":
+            send_whatsapp_text(sender_phone,
+                "📸 Please *send a photo* of your 12-lead ECG printout.\n\n"
+                "_(Type *menu* to return to the main menu)_",
+                phone_number_id)
+            return {"status": "ok"}
+
+        # ── Q&A mode — answer with Groq AI ────────────────────────────────────
+        if state == "qa_mode":
+            logger.info("[WA QA] %s: %s", sender_phone, txt[:80])
+            history = session.get("qa_history", [])
+            answer  = _groq_call(txt, history)
+
+            # Keep last 10 turns (20 messages) to avoid token bloat
+            history.append({"role": "user",      "content": txt})
+            history.append({"role": "assistant",  "content": answer})
+            session["qa_history"] = history[-20:]
+
+            send_whatsapp_text(sender_phone, answer, phone_number_id)
+            return {"status": "ok"}
+
+        # ── Fallback (should not reach here) ──────────────────────────────────
+        session["state"]      = "menu"
+        session["qa_history"] = []
+        send_whatsapp_text(sender_phone, _WELCOME_MSG, phone_number_id)
 
     except Exception as e:
         logger.exception("[WA] Webhook error: %s", e)
@@ -781,6 +939,7 @@ def health():
         "whatsapp_token_set":    bool(META_API_TOKEN),
         "whatsapp_phone_id_set": bool(WHATSAPP_PHONE_NUMBER_ID),
         "webhook_verify_token":  WEBHOOK_VERIFY_TOKEN,
+        "groq_configured":       bool(GROQ_API_KEY),
     }
 
 if __name__ == "__main__":
